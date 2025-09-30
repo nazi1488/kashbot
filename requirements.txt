@@ -1,0 +1,43 @@
+# Telegram Bot API
+python-telegram-bot==20.7
+
+# Обработка медиафайлов
+ffmpeg-python==0.2.0
+Pillow==10.2.0
+
+# Работа с массивами для добавления шума
+numpy==1.26.3
+
+# Асинхронные HTTP запросы (опционально, для расширенной проверки подписки)
+aiohttp==3.9.1
+
+# Переменные окружения
+python-dotenv==1.0.0
+
+# Логирование (расширенные возможности)
+colorlog==6.8.0
+
+# Дополнительно для поддержки AVIF (опционально)
+# pillow-avif==1.4.1
+
+# Мониторинг системных ресурсов
+psutil==5.9.8
+
+# Работа с базой данных
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.23
+alembic==1.13.0
+yt-dlp==2024.03.10
+opencv-python==4.9.0.80
+
+# 2FA TOTP генератор
+qrcode[pil]==7.4.2
+
+# Парсинг HTML для KashMail
+beautifulsoup4==4.12.2
+
+# Random Face Generator
+httpx==0.26.0
+redis==5.0.1
+pydantic==2.5.2
+pydantic-settings==2.1.0
