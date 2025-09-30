@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:16
+    container_name: tg_metrics_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: supersecret
+    ports:
+      - "5432:5432"   # локально ок; на VPS это уберём
+    volumes:
+      - db_data:/var/lib/postgresql/data
+volumes:
+  db_data:
