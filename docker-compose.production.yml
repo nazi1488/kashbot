@@ -1,0 +1,272 @@
+version: '3.8'
+
+services:
+  # Self-hosted Telegram Bot API
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: "${TELEGRAM_API_ID}"
+      TELEGRAM_API_HASH: "${TELEGRAM_API_HASH}"
+      TELEGRAM_LOCAL: "true"
+    ports:
+      - "8081:8081"
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+      - ./logs/telegram-api:/var/log/telegram-bot-api
+    command:
+      - "--api-id=${TELEGRAM_API_ID}"
+      - "--api-hash=${TELEGRAM_API_HASH}"
+      - "--local"
+      - "--port=8081"
+      - "--max-file-upload-size=2000"
+      - "--file-gc-timeout=3600"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - bot_network
+
+  # PostgreSQL база данных
+  postgres:
+    image: postgres:15-alpine
+    container_name: bot_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-bot_db}
+      POSTGRES_USER: ${DB_USER:-bot_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_MAX_CONNECTIONS: 200
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-bot_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bot_network
+
+  # Redis для очереди задач и кэша
+  redis:
+    image: redis:7-alpine
+    container_name: bot_redis
+    restart: unless-stopped
+    command: redis-server --maxmemory 1gb --maxmemory-policy allkeys-lru --save 60 1
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bot_network
+
+  # Основной бот (webhook handler)
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram_bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      telegram-bot-api:
+        condition: service_healthy
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - USE_LOCAL_BOT_API=true
+      - LOCAL_BOT_API_URL=http://telegram-bot-api:8081
+      - DATABASE_URL=postgresql://${DB_USER:-bot_user}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-bot_db}
+      - REDIS_URL=redis://redis:6379/0
+      - WEBHOOK_DOMAIN=${WEBHOOK_DOMAIN}
+      - WEBHOOK_PORT=8443
+      - KEITARO_WEBHOOK_PORT=8080
+      - MAX_FILE_SIZE=524288000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - USE_WEBHOOK=true
+    volumes:
+      - ./logs:/app/logs
+      - ./temp:/tmp/bot_temp
+      - ./locales:/app/locales:ro
+    ports:
+      - "127.0.0.1:8443:8443"
+      - "8080:8080"  # Keitaro webhook
+    command: python main_webhook.py
+    networks:
+      - bot_network
+
+  # Celery воркер для видео (CPU-intensive)
+  worker_video:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: worker_video
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-bot_user}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-bot_db}
+      - REDIS_URL=redis://redis:6379/0
+      - BOT_TOKEN=${BOT_TOKEN}
+      - USE_LOCAL_BOT_API=true
+      - LOCAL_BOT_API_URL=http://telegram-bot-api:8081
+      - MAX_FILE_SIZE=524288000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./temp:/tmp/bot_temp
+    command: celery -A celery_app worker -Q video -n worker_video@%h --loglevel=info --concurrency=2
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    networks:
+      - bot_network
+
+  # Celery воркер для изображений
+  worker_image:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: worker_image
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-bot_user}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-bot_db}
+      - REDIS_URL=redis://redis:6379/0
+      - BOT_TOKEN=${BOT_TOKEN}
+      - USE_LOCAL_BOT_API=true
+      - LOCAL_BOT_API_URL=http://telegram-bot-api:8081
+      - MAX_FILE_SIZE=524288000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./temp:/tmp/bot_temp
+    command: celery -A celery_app worker -Q image,compress -n worker_image@%h --loglevel=info --concurrency=4
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    networks:
+      - bot_network
+
+  # Celery воркер для скачивания
+  worker_download:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: worker_download
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - postgres
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-bot_user}:${DB_PASSWORD}@postgres:5432/${DB_NAME:-bot_db}
+      - REDIS_URL=redis://redis:6379/0
+      - BOT_TOKEN=${BOT_TOKEN}
+      - USE_LOCAL_BOT_API=true
+      - LOCAL_BOT_API_URL=http://telegram-bot-api:8081
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+      - ./temp:/tmp/bot_temp
+      - ./cookies:/app/cookies:ro
+    command: celery -A celery_app worker -Q download,default -n worker_download@%h --loglevel=info --concurrency=3
+    networks:
+      - bot_network
+
+  # Celery beat для периодических задач
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: celery_beat
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./logs:/app/logs
+    command: celery -A celery_app beat --loglevel=info
+    networks:
+      - bot_network
+
+  # Flower для мониторинга Celery
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flower_monitor
+    restart: unless-stopped
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - FLOWER_BASIC_AUTH=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+    ports:
+      - "127.0.0.1:5555:5555"
+    command: celery -A celery_app flower --port=5555
+    networks:
+      - bot_network
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: bot_nginx
+    restart: unless-stopped
+    depends_on:
+      - bot
+    volumes:
+      - ./nginx.production.conf:/etc/nginx/nginx.conf:ro
+      - /etc/letsencrypt/live/${WEBHOOK_DOMAIN}/fullchain.pem:/etc/nginx/ssl/fullchain.pem:ro
+      - /etc/letsencrypt/live/${WEBHOOK_DOMAIN}/privkey.pem:/etc/nginx/ssl/privkey.pem:ro
+      - nginx_logs:/var/log/nginx
+    ports:
+      - "443:443"
+      - "80:80"
+    networks:
+      - bot_network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  telegram-bot-api-data:
+  postgres_data:
+  redis_data:
+  nginx_logs:
+
+networks:
+  bot_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
